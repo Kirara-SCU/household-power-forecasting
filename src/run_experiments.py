@@ -36,6 +36,8 @@ TARGET = "global_active_power"
 
 @dataclass(frozen=True)
 class Dataset:
+    """Daily train/test split plus the feature list used by all models."""
+
     train: pd.DataFrame
     test: pd.DataFrame
     features: list[str]
@@ -43,6 +45,8 @@ class Dataset:
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize common column-name variants from course CSVs or the UCI raw file."""
+
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
     rename = {
@@ -56,6 +60,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a single datetime column from either datetime or date/time fields."""
+
     df = df.copy()
     if "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
@@ -70,6 +76,8 @@ def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert numeric-looking columns and treat UCI '?' markers as missing values."""
+
     df = df.copy()
     for col in df.columns:
         if col not in {"date", "time", "datetime"}:
@@ -78,6 +86,8 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate minute-level records to the daily granularity required by the task."""
+
     df = parse_datetime(to_numeric(normalize_columns(df)))
     df["day"] = df["datetime"].dt.floor("D")
     agg: dict[str, str] = {}
@@ -93,9 +103,13 @@ def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     if TARGET not in agg:
         raise ValueError(f"Required target column {TARGET!r} is missing.")
 
+    # Course rules: energy-like columns are summed by day, voltage/current are averaged,
+    # and weather columns keep one representative daily value.
     daily = df.groupby("day", as_index=False).agg(agg).sort_values("day")
     daily = daily.set_index("day").asfreq("D").reset_index()
     value_cols = [c for c in daily.columns if c != "day"]
+    # Missing days or missing records are filled after calendar reindexing so windows
+    # always represent consecutive days.
     daily[value_cols] = daily[value_cols].interpolate(limit_direction="both")
     daily[value_cols] = daily[value_cols].fillna(daily[value_cols].median(numeric_only=True))
 
@@ -110,6 +124,8 @@ def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def find_course_csvs() -> tuple[Path | None, Path | None]:
+    """Prefer teacher-provided train/test files when they are present."""
+
     candidates = [ROOT, DATA_DIR]
     train = None
     test = None
@@ -126,6 +142,8 @@ def find_course_csvs() -> tuple[Path | None, Path | None]:
 
 
 def download_uci() -> Path:
+    """Download the public UCI fallback dataset for local verification."""
+
     DATA_DIR.mkdir(exist_ok=True)
     txt_path = DATA_DIR / "household_power_consumption.txt"
     zip_path = DATA_DIR / "household_power_consumption.zip"
@@ -139,6 +157,8 @@ def download_uci() -> Path:
 
 
 def load_dataset() -> Dataset:
+    """Load course data if available; otherwise create a reproducible UCI fallback split."""
+
     train_csv, test_csv = find_course_csvs()
     if train_csv and test_csv:
         print(f"Using course files: {train_csv.name}, {test_csv.name}")
@@ -150,6 +170,8 @@ def load_dataset() -> Dataset:
         raw_path = download_uci()
         raw = pd.read_csv(raw_path, sep=";", low_memory=False)
         daily = daily_aggregate(raw)
+        # Keep enough trailing days for the 365-day test horizon while preserving most
+        # observations for training. This branch is only a fallback when course CSVs are absent.
         split = min(int(len(daily) * 0.75), len(daily) - 365)
         if split < 455:
             raise ValueError("UCI fallback data is too short for 90-day input and 365-day output.")
@@ -158,12 +180,15 @@ def load_dataset() -> Dataset:
     features = [c for c in train.columns if c not in {"day"}]
     missing = [c for c in features if c not in test.columns]
     for col in missing:
+        # Some course test files may omit optional weather/sub-meter columns.
         test[col] = train[col].median()
     test = test[["day"] + features]
     return Dataset(train=train, test=test, features=features)
 
 
 def standardize(train: pd.DataFrame, test: pd.DataFrame, features: list[str], target: str):
+    """Standardize with training statistics only to avoid leaking test information."""
+
     x_mean = train[features].mean()
     x_std = train[features].std().replace(0, 1.0)
     y_mean = float(train[target].mean())
@@ -176,6 +201,8 @@ def standardize(train: pd.DataFrame, test: pd.DataFrame, features: list[str], ta
 
 
 def make_windows(x: np.ndarray, y: np.ndarray, input_len: int, horizon: int):
+    """Create samples shaped as past input_len days -> future horizon days."""
+
     xs, ys = [], []
     end = len(x) - input_len - horizon + 1
     for i in range(max(0, end)):
@@ -190,6 +217,8 @@ def make_windows(x: np.ndarray, y: np.ndarray, input_len: int, horizon: int):
 
 
 def ridge_fit(phi: np.ndarray, y: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+    """Fit the multi-output linear head using ridge regression."""
+
     phi = np.c_[np.ones(len(phi)), phi]
     eye = np.eye(phi.shape[1])
     eye[0, 0] = 0.0
@@ -201,6 +230,8 @@ def ridge_predict(phi: np.ndarray, w: np.ndarray) -> np.ndarray:
 
 
 class BaseModel:
+    """Shared fixed-encoder plus trainable linear-head forecasting interface."""
+
     def __init__(self, seed: int, hidden: int = 32):
         self.rng = np.random.default_rng(seed)
         self.hidden = hidden
@@ -210,6 +241,8 @@ class BaseModel:
         raise NotImplementedError
 
     def fit(self, x: np.ndarray, y: np.ndarray):
+        # The reservoir encoders are randomly initialized per seed; only the linear
+        # output layer is fitted, which keeps the assignment runnable without PyTorch.
         phi = self.encode(x)
         self.weights = ridge_fit(phi, y, alpha=2.0)
         return self
@@ -225,6 +258,7 @@ class LSTMReservoir(BaseModel):
 
     def fit(self, x: np.ndarray, y: np.ndarray):
         d = x.shape[-1]
+        # Fixed random gates approximate an LSTM-style recurrent encoder.
         self.w_i = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
         self.w_f = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
         self.w_o = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
@@ -235,6 +269,7 @@ class LSTMReservoir(BaseModel):
         h = np.zeros((x.shape[0], self.hidden))
         c = np.zeros_like(h)
         for t in range(x.shape[1]):
+            # Standard LSTM gate equations, vectorized over all windows.
             z = np.c_[x[:, t, :], h]
             i = 1.0 / (1.0 + np.exp(-(z @ self.w_i)))
             f = 1.0 / (1.0 + np.exp(-(z @ self.w_f)))
@@ -242,6 +277,7 @@ class LSTMReservoir(BaseModel):
             g = np.tanh(z @ self.w_g)
             c = f * c + i * g
             h = o * np.tanh(c)
+        # Combine learned recurrent state with simple window statistics for robustness.
         stats = np.c_[x[:, -1, :], x.mean(axis=1), x.std(axis=1), h]
         return stats
 
@@ -251,6 +287,7 @@ class TransformerReservoir(BaseModel):
 
     def fit(self, x: np.ndarray, y: np.ndarray):
         d = x.shape[-1]
+        # Single-head attention projections; the last day acts as the query.
         self.w_q = self.rng.normal(0, 0.22, (d, self.hidden))
         self.w_k = self.rng.normal(0, 0.22, (d, self.hidden))
         self.w_v = self.rng.normal(0, 0.22, (d, self.hidden))
@@ -260,6 +297,7 @@ class TransformerReservoir(BaseModel):
         q = x[:, -1, :] @ self.w_q
         k = x @ self.w_k
         v = x @ self.w_v
+        # Attention weights select relevant days from the full 90-day history.
         scores = np.einsum("bh,bth->bt", q, k) / math.sqrt(self.hidden)
         scores -= scores.max(axis=1, keepdims=True)
         attn = np.exp(scores)
@@ -274,6 +312,7 @@ class CNNAttentionReservoir(BaseModel):
 
     def fit(self, x: np.ndarray, y: np.ndarray):
         d = x.shape[-1]
+        # A width-5 temporal convolution extracts local usage patterns before attention.
         self.kernels = self.rng.normal(0, 0.18, (5, d, self.hidden))
         self.w_q = self.rng.normal(0, 0.20, (self.hidden, self.hidden))
         self.w_k = self.rng.normal(0, 0.20, (self.hidden, self.hidden))
@@ -281,6 +320,7 @@ class CNNAttentionReservoir(BaseModel):
         return super().fit(x, y)
 
     def encode(self, x: np.ndarray) -> np.ndarray:
+        # Edge padding keeps the encoded sequence length equal to input_len.
         padded = np.pad(x, ((0, 0), (2, 2), (0, 0)), mode="edge")
         conv = []
         for t in range(x.shape[1]):
@@ -295,6 +335,7 @@ class CNNAttentionReservoir(BaseModel):
         attn = np.exp(scores)
         attn /= attn.sum(axis=1, keepdims=True)
         context = np.einsum("bt,bth->bh", attn, v)
+        # A coarse trend feature helps the long-horizon model distinguish rising/falling windows.
         trend = x[:, -30:, :].mean(axis=1) - x[:, :30, :].mean(axis=1)
         return np.c_[x[:, -1, :], x.mean(axis=1), trend, np.tanh(context)]
 
@@ -305,6 +346,8 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
 
 
 def draw_table(summary: pd.DataFrame, path: Path):
+    """Render a PNG table so the report can include results as a screenshot."""
+
     rows = [["Model", "Horizon", "MSE mean", "MSE std", "MAE mean", "MAE std"]]
     for _, r in summary.iterrows():
         rows.append(
@@ -336,6 +379,8 @@ def draw_table(summary: pd.DataFrame, path: Path):
 
 
 def draw_curve(y_true: np.ndarray, y_pred: np.ndarray, title: str, path: Path):
+    """Render prediction vs. ground-truth curves without requiring matplotlib."""
+
     width, height = 1000, 520
     margin_l, margin_r, margin_t, margin_b = 70, 30, 55, 60
     img = Image.new("RGB", (width, height), "white")
@@ -383,16 +428,20 @@ def run(args):
     predictions = {}
 
     for horizon in horizons:
+        # Short-term and long-term tasks are trained independently as required.
         xtr, ytr = make_windows(train_x, train_y, args.input_len, horizon)
         xte, yte = make_windows(
+            # Prepend the final training window so the first test prediction has 90 days of history.
             np.vstack([train_x[-args.input_len :], test_x]),
             np.r_[train_y[-args.input_len :], test_y],
             args.input_len,
             horizon,
         )
         if args.max_train_samples:
+            # Optional acceleration for smoke tests; full experiments leave this unset.
             xtr = xtr[-args.max_train_samples :]
             ytr = ytr[-args.max_train_samples :]
+        # Report figures use the final available forecast window for each horizon.
         xte_last, yte_last = xte[-1:], yte[-1:]
 
         for model_cls in models:
@@ -400,6 +449,7 @@ def run(args):
                 seed = args.seed + run_id
                 model = model_cls(seed=seed, hidden=args.hidden).fit(xtr, ytr)
                 pred = model.predict(xte_last)
+                # Convert back to the original power scale before computing final metrics.
                 true_real = yte_last[0] * y_std + y_mean
                 pred_real = pred[0] * y_std + y_mean
                 mse, mae = metrics(true_real, pred_real)
@@ -418,6 +468,7 @@ def run(args):
                     f"run={run_id + 1} mse={mse:.3f} mae={mae:.3f}"
                 )
 
+    # Save both raw repeated-run metrics and the mean/std summary required by the assignment.
     metrics_df = pd.DataFrame(rows)
     metrics_df.to_csv(OUTPUT_DIR / "metrics.csv", index=False, encoding="utf-8-sig")
     summary = (
