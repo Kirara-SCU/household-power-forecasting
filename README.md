@@ -18,12 +18,7 @@ For each method, the script separately trains short-term and long-term forecaste
 
 ## Data
 
-Put the course CSV files in `data/` or the project root:
-
-- `train.csv`
-- `test.csv` or `tes.csv`
-
-If the course files are not present, the script attempts to download the UCI Individual household electric power consumption dataset and creates a time-ordered split automatically.
+Use the UCI Individual household electric power consumption dataset.
 
 ## Run
 
@@ -43,7 +38,3 @@ Outputs are written to `outputs/`:
 - `metrics_summary.csv`
 - `metrics_summary.png`
 - prediction curve figures for each model and horizon
-
-## GitHub
-
-After creating the remote repository, update the link in `report/report.tex`.
