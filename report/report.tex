@@ -6,11 +6,14 @@
 \usepackage{float}
 \usepackage{amsmath}
 \usepackage{listings}
+\usepackage{xurl}
 \geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
 \hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue,citecolor=black}
+\Urlmuskip=0mu plus 1mu
+\pagestyle{plain}
 
 \title{基于 LSTM、Transformer 与 CNN-Transformer 的家庭电力消耗预测}
-\author{姓名：宫爵\underline{\hspace{4cm}} \quad 学号：20255227048\underline{\hspace{4cm}}\\}
+\author{姓名：宫爵 \quad 学号：20255227048\\}
 \date{2026年7月}
 
 \begin{document}
@@ -25,7 +28,15 @@
 
 本实验使用 UCI Machine Learning Repository 公开的 ``Individual household electric power consumption'' 原始分钟级数据，目标是根据过去90天的多变量观测序列预测未来每天的总有功功率 \texttt{global\_active\_power}。按照课程要求，实验分别完成短期预测和长期预测两类任务：短期预测为未来90天，长期预测为未来365天。两个任务分别训练模型，长期预测模型参数不复用短期预测模型参数。
 
-数据预处理遵循课程说明：\texttt{global\_active\_power}、\texttt{global\_reactive\_power}、\texttt{sub\_metering\_1}、\texttt{sub\_metering\_2} 和 \texttt{sub\_metering\_3} 按天求和；\texttt{voltage} 与 \texttt{global\_intensity} 按天求均值。UCI 原始数据未包含课程说明中的气象变量，因此本实验不额外融合天气特征。缺失值使用时间插值和中位数补齐。若三路分表数据完整，则额外构造
+数据预处理遵循课程说明：家庭总有功功率、总无功功率和三路分表能耗按天求和，电压和电流强度按天求均值。对应字段如下：
+
+\begin{lstlisting}[basicstyle=\footnotesize\ttfamily,breaklines=true]
+global_active_power, global_reactive_power,
+sub_metering_1, sub_metering_2, sub_metering_3,
+voltage, global_intensity
+\end{lstlisting}
+
+UCI 原始数据未包含课程说明中的气象变量，因此本实验不额外融合天气特征。缺失值使用时间插值和中位数补齐。若三路分表数据完整，则额外构造
 \[
 \texttt{sub\_metering\_remainder}=
 \frac{\texttt{global\_active\_power}\times1000}{60}
@@ -83,7 +94,7 @@ python src/run_experiments.py --runs 5
 \label{fig:run-screenshot-2}
 \end{figure}
 
-完整实验结果由程序自动写入 \texttt{outputs/metrics.csv}，汇总结果写入 \texttt{outputs/metrics\_summary.csv}。下图为五轮实验的均值与标准差截图。
+完整实验结果由程序自动写入 \texttt{outputs} 目录，其中逐轮指标保存在 \texttt{metrics.csv}，均值与标准差保存在 \texttt{metrics\_summary.csv}。下图为五轮实验的均值与标准差截图。
 
 \begin{figure}[H]
 \centering
@@ -141,24 +152,31 @@ python src/run_experiments.py --runs 5
 
 此外，长期预测误差较高并不一定说明模型完全失效。家庭用电受节假日、气温、家庭行为变化等不可观测因素影响明显，仅凭过去90天预测未来365天具有天然不确定性。改进方向包括：加入更完整的天气变量、节假日特征和月份周期编码；使用多尺度窗口同时输入短期和长期历史；采用概率预测给出置信区间，而非只输出单条预测曲线。
 
-\begin{thebibliography}{9}
+\begin{thebibliography}{99}
 \bibitem{uci}
-UCI Machine Learning Repository.
-Individual household electric power consumption dataset.
-\url{https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption}
+G. Hebrail and A. Berard.
+\newblock Individual household electric power consumption.
+\newblock UCI Machine Learning Repository, 2012.
+\newblock \url{https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption}
 
 \bibitem{lstm}
-Hochreiter, S. and Schmidhuber, J.
-Long Short-Term Memory.
-Neural Computation, 1997.
+S. Hochreiter and J. Schmidhuber.
+\newblock Long short-term memory.
+\newblock \emph{Neural Computation}, 9(8):1735--1780, 1997.
+\newblock doi: \href{https://doi.org/10.1162/neco.1997.9.8.1735}{10.1162/neco.1997.9.8.1735}.
 
 \bibitem{transformer}
-Vaswani, A. et al.
-Attention Is All You Need.
-Advances in Neural Information Processing Systems, 2017.
+A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones,
+A. N. Gomez, L. Kaiser, and I. Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{Advances in Neural Information Processing Systems 30},
+pages 5998--6008, 2017.
+\newblock arXiv: \href{https://arxiv.org/abs/1706.03762}{1706.03762}.
 
 \bibitem{chatgpt}
-本文报告语言组织和代码草稿生成过程中使用了 ChatGPT 辅助，实验设计、结果运行与最终修改由作者完成。
+OpenAI.
+\newblock ChatGPT.
+\newblock 用于辅助报告语言组织和代码草稿生成；实验设计、结果运行与最终修改由作者完成, 2026.
 \end{thebibliography}
 
 \end{document}
