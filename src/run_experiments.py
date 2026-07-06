@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
+import sys
 import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+# Anaconda, PyTorch and plotting libraries may load different OpenMP DLLs on
+# Windows. Set this before importing torch/numpy/matplotlib so the script can
+# finish and print the result table in the common local course environment.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import matplotlib
 
@@ -452,6 +459,7 @@ def run(args):
     log("Household power forecasting experiment")
     log("=" * 72)
     log(f"Using device: {device}")
+    log(f"Python executable: {sys.executable}")
     log(
         "Config: "
         f"runs={args.runs}, epochs={args.epochs}, input_len={args.input_len}, "
@@ -526,7 +534,6 @@ def run(args):
         .reset_index()
     )
     summary.to_csv(OUTPUT_DIR / "metrics_summary.csv", index=False, encoding="utf-8-sig")
-    draw_table(summary, OUTPUT_DIR / "metrics_summary.png")
 
     display = summary.copy()
     for col in ["mse_mean", "mse_std", "mae_mean", "mae_std"]:
@@ -536,6 +543,8 @@ def run(args):
     log(f"Final {args.runs}-run summary (mean +/- std)")
     log("=" * 72)
     log(display.to_string(index=False))
+
+    draw_table(summary, OUTPUT_DIR / "metrics_summary.png")
 
     for (model_name, horizon), (true, pred) in prediction_figures.items():
         safe_model = model_name.lower().replace("-", "_")

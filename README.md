@@ -26,6 +26,12 @@ The script downloads and uses the UCI Individual household electric power consum
 python src/run_experiments.py --runs 5
 ```
 
+On Windows, if `python` points to the Microsoft Store alias and prints nothing, use Anaconda explicitly:
+
+```powershell
+D:\anaconda\python.exe src\run_experiments.py --runs 5
+```
+
 Use `--epochs` to increase or reduce the number of training epochs.
 
 Useful faster smoke test:
