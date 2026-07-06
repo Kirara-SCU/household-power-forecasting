@@ -4,9 +4,9 @@ This project implements the machine learning final assignment for multivariate h
 
 It trains and evaluates three methods:
 
-1. LSTM-style recurrent reservoir encoder
-2. Transformer-style self-attention encoder
-3. Proposed CNN-attention hybrid encoder
+1. Fully trainable LSTM forecaster
+2. Fully trainable Transformer encoder forecaster
+3. Proposed CNN-Transformer hybrid forecaster
 
 For each method, the script separately trains short-term and long-term forecasters:
 
@@ -18,7 +18,7 @@ For each method, the script separately trains short-term and long-term forecaste
 
 ## Data
 
-Use the UCI Individual household electric power consumption dataset.
+The script downloads and uses the UCI Individual household electric power consumption dataset by default.
 
 ## Run
 
@@ -26,10 +26,12 @@ Use the UCI Individual household electric power consumption dataset.
 python src/run_experiments.py --runs 5
 ```
 
+Use `--epochs` to increase or reduce the number of training epochs.
+
 Useful faster smoke test:
 
 ```powershell
-python src/run_experiments.py --runs 1 --max-train-samples 80
+python src/run_experiments.py --runs 1 --epochs 1 --hidden 16 --layers 1 --max-train-samples 32
 ```
 
 Outputs are written to `outputs/`:

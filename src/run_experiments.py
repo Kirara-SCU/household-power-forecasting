@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
-import os
+import random
 import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageDraw, ImageFont
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +36,6 @@ SUM_COLUMNS = [
     "sub_metering_3",
 ]
 MEAN_COLUMNS = ["voltage", "global_intensity"]
-WEATHER_COLUMNS = ["RR", "NBJRR1", "NBJRR5", "NBJRR10", "NBJBROU"]
 TARGET = "global_active_power"
 
 
@@ -44,23 +49,32 @@ class Dataset:
     target: str = TARGET
 
 
+def set_seed(seed: int) -> None:
+    """Make one experiment run reproducible."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize common column-name variants from course CSVs or the UCI raw file."""
+    """Normalize common column-name variants in the UCI raw file."""
 
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
-    rename = {
-        "sub_metering_3": "sub_metering_3",
-        "sub_metering3": "sub_metering_3",
-        "globalactivepower": "global_active_power",
-        "globalreactivepower": "global_reactive_power",
-        "globalintensity": "global_intensity",
-    }
-    return df.rename(columns=rename)
+    return df.rename(
+        columns={
+            "sub_metering3": "sub_metering_3",
+            "globalactivepower": "global_active_power",
+            "globalreactivepower": "global_reactive_power",
+            "globalintensity": "global_intensity",
+        }
+    )
 
 
 def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Build a single datetime column from either datetime or date/time fields."""
+    """Build a single datetime column from date/time fields."""
 
     df = df.copy()
     if "datetime" in df.columns:
@@ -71,7 +85,7 @@ def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
     elif "date" in df.columns:
         df["datetime"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     else:
-        raise ValueError("CSV must contain either datetime or date/time columns.")
+        raise ValueError("Data must contain either datetime or date/time columns.")
     return df.dropna(subset=["datetime"])
 
 
@@ -86,7 +100,7 @@ def to_numeric(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate minute-level records to the daily granularity required by the task."""
+    """Aggregate minute-level records to daily samples required by the assignment."""
 
     df = parse_datetime(to_numeric(normalize_columns(df)))
     df["day"] = df["datetime"].dt.floor("D")
@@ -97,19 +111,14 @@ def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     for col in MEAN_COLUMNS:
         if col in df.columns:
             agg[col] = "mean"
-    for col in WEATHER_COLUMNS:
-        if col.lower() in df.columns:
-            agg[col.lower()] = "first"
     if TARGET not in agg:
         raise ValueError(f"Required target column {TARGET!r} is missing.")
 
-    # Course rules: energy-like columns are summed by day, voltage/current are averaged,
-    # and weather columns keep one representative daily value.
+    # Course rules: energy-like columns are summed by day, voltage/current are averaged.
     daily = df.groupby("day", as_index=False).agg(agg).sort_values("day")
     daily = daily.set_index("day").asfreq("D").reset_index()
     value_cols = [c for c in daily.columns if c != "day"]
-    # Missing days or missing records are filled after calendar reindexing so windows
-    # always represent consecutive days.
+    # Calendar reindexing plus interpolation ensures every window is consecutive in time.
     daily[value_cols] = daily[value_cols].interpolate(limit_direction="both")
     daily[value_cols] = daily[value_cols].fillna(daily[value_cols].median(numeric_only=True))
 
@@ -123,33 +132,15 @@ def daily_aggregate(df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-def find_course_csvs() -> tuple[Path | None, Path | None]:
-    """Prefer teacher-provided train/test files when they are present."""
-
-    candidates = [ROOT, DATA_DIR]
-    train = None
-    test = None
-    for base in candidates:
-        for name in ("train.csv", "Train.csv"):
-            p = base / name
-            if p.exists():
-                train = p
-        for name in ("test.csv", "tes.csv", "Test.csv", "Tes.csv"):
-            p = base / name
-            if p.exists():
-                test = p
-    return train, test
-
-
 def download_uci() -> Path:
-    """Download the public UCI fallback dataset for local verification."""
+    """Download and extract the public UCI dataset when it is not already local."""
 
     DATA_DIR.mkdir(exist_ok=True)
     txt_path = DATA_DIR / "household_power_consumption.txt"
     zip_path = DATA_DIR / "household_power_consumption.zip"
     if txt_path.exists():
         return txt_path
-    print("Course CSV files were not found; downloading UCI fallback dataset...")
+    print("Downloading UCI Individual household electric power consumption dataset...")
     urllib.request.urlretrieve(UCI_URL, zip_path)
     with zipfile.ZipFile(zip_path) as zf:
         zf.extract("household_power_consumption.txt", DATA_DIR)
@@ -157,46 +148,31 @@ def download_uci() -> Path:
 
 
 def load_dataset() -> Dataset:
-    """Load course data if available; otherwise create a reproducible UCI fallback split."""
+    """Load UCI raw minute-level data and create a time-ordered train/test split."""
 
-    train_csv, test_csv = find_course_csvs()
-    if train_csv and test_csv:
-        print(f"Using course files: {train_csv.name}, {test_csv.name}")
-        train_raw = pd.read_csv(train_csv)
-        test_raw = pd.read_csv(test_csv)
-        train = daily_aggregate(train_raw)
-        test = daily_aggregate(test_raw)
-    else:
-        raw_path = download_uci()
-        raw = pd.read_csv(raw_path, sep=";", low_memory=False)
-        daily = daily_aggregate(raw)
-        # Keep enough trailing days for the 365-day test horizon while preserving most
-        # observations for training. This branch is only a fallback when course CSVs are absent.
-        split = min(int(len(daily) * 0.75), len(daily) - 365)
-        if split < 455:
-            raise ValueError("UCI fallback data is too short for 90-day input and 365-day output.")
-        train, test = daily.iloc[:split].copy(), daily.iloc[split:].copy()
-
-    features = [c for c in train.columns if c not in {"day"}]
-    missing = [c for c in features if c not in test.columns]
-    for col in missing:
-        # Some course test files may omit optional weather/sub-meter columns.
-        test[col] = train[col].median()
-    test = test[["day"] + features]
+    raw_path = download_uci()
+    raw = pd.read_csv(raw_path, sep=";", low_memory=False)
+    daily = daily_aggregate(raw)
+    # Hold out the last quarter, with at least 365 days reserved for long-horizon testing.
+    split = min(int(len(daily) * 0.75), len(daily) - 365)
+    if split < 455:
+        raise ValueError("UCI data is too short for 90-day input and 365-day output.")
+    train, test = daily.iloc[:split].copy(), daily.iloc[split:].copy()
+    features = [c for c in train.columns if c != "day"]
     return Dataset(train=train, test=test, features=features)
 
 
 def standardize(train: pd.DataFrame, test: pd.DataFrame, features: list[str], target: str):
-    """Standardize with training statistics only to avoid leaking test information."""
+    """Standardize with training statistics only to avoid test leakage."""
 
     x_mean = train[features].mean()
     x_std = train[features].std().replace(0, 1.0)
     y_mean = float(train[target].mean())
     y_std = float(train[target].std() or 1.0)
-    train_x = ((train[features] - x_mean) / x_std).to_numpy(dtype=np.float64)
-    test_x = ((test[features] - x_mean) / x_std).to_numpy(dtype=np.float64)
-    train_y = ((train[target] - y_mean) / y_std).to_numpy(dtype=np.float64)
-    test_y = ((test[target] - y_mean) / y_std).to_numpy(dtype=np.float64)
+    train_x = ((train[features] - x_mean) / x_std).to_numpy(dtype=np.float32)
+    test_x = ((test[features] - x_mean) / x_std).to_numpy(dtype=np.float32)
+    train_y = ((train[target] - y_mean) / y_std).to_numpy(dtype=np.float32)
+    test_y = ((test[target] - y_mean) / y_std).to_numpy(dtype=np.float32)
     return train_x, test_x, train_y, test_y, y_mean, y_std
 
 
@@ -213,131 +189,213 @@ def make_windows(x: np.ndarray, y: np.ndarray, input_len: int, horizon: int):
             f"Not enough daily rows for input={input_len}, horizon={horizon}. "
             f"Need at least {input_len + horizon}, got {len(x)}."
         )
-    return np.stack(xs), np.stack(ys)
+    return np.stack(xs).astype(np.float32), np.stack(ys).astype(np.float32)
 
 
-def ridge_fit(phi: np.ndarray, y: np.ndarray, alpha: float = 1.0) -> np.ndarray:
-    """Fit the multi-output linear head using ridge regression."""
+class LSTMForecaster(nn.Module):
+    """Fully trainable LSTM encoder with a multi-step regression head."""
 
-    phi = np.c_[np.ones(len(phi)), phi]
-    eye = np.eye(phi.shape[1])
-    eye[0, 0] = 0.0
-    return np.linalg.solve(phi.T @ phi + alpha * eye, phi.T @ y)
-
-
-def ridge_predict(phi: np.ndarray, w: np.ndarray) -> np.ndarray:
-    return np.c_[np.ones(len(phi)), phi] @ w
-
-
-class BaseModel:
-    """Shared fixed-encoder plus trainable linear-head forecasting interface."""
-
-    def __init__(self, seed: int, hidden: int = 32):
-        self.rng = np.random.default_rng(seed)
-        self.hidden = hidden
-        self.weights: np.ndarray | None = None
-
-    def encode(self, x: np.ndarray) -> np.ndarray:
-        raise NotImplementedError
-
-    def fit(self, x: np.ndarray, y: np.ndarray):
-        # The reservoir encoders are randomly initialized per seed; only the linear
-        # output layer is fitted, which keeps the assignment runnable without PyTorch.
-        phi = self.encode(x)
-        self.weights = ridge_fit(phi, y, alpha=2.0)
-        return self
-
-    def predict(self, x: np.ndarray) -> np.ndarray:
-        if self.weights is None:
-            raise RuntimeError("Model is not fitted.")
-        return ridge_predict(self.encode(x), self.weights)
-
-
-class LSTMReservoir(BaseModel):
     name = "LSTM"
 
-    def fit(self, x: np.ndarray, y: np.ndarray):
-        d = x.shape[-1]
-        # Fixed random gates approximate an LSTM-style recurrent encoder.
-        self.w_i = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
-        self.w_f = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
-        self.w_o = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
-        self.w_g = self.rng.normal(0, 0.16, (d + self.hidden, self.hidden))
-        return super().fit(x, y)
+    def __init__(self, n_features: int, hidden: int, layers: int, horizon: int, dropout: float):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden,
+            num_layers=layers,
+            dropout=dropout if layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, horizon),
+        )
 
-    def encode(self, x: np.ndarray) -> np.ndarray:
-        h = np.zeros((x.shape[0], self.hidden))
-        c = np.zeros_like(h)
-        for t in range(x.shape[1]):
-            # Standard LSTM gate equations, vectorized over all windows.
-            z = np.c_[x[:, t, :], h]
-            i = 1.0 / (1.0 + np.exp(-(z @ self.w_i)))
-            f = 1.0 / (1.0 + np.exp(-(z @ self.w_f)))
-            o = 1.0 / (1.0 + np.exp(-(z @ self.w_o)))
-            g = np.tanh(z @ self.w_g)
-            c = f * c + i * g
-            h = o * np.tanh(c)
-        # Combine learned recurrent state with simple window statistics for robustness.
-        stats = np.c_[x[:, -1, :], x.mean(axis=1), x.std(axis=1), h]
-        return stats
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        return self.head(out[:, -1])
 
 
-class TransformerReservoir(BaseModel):
+class PositionalEncoding(nn.Module):
+    """Sinusoidal position encoding for daily time steps."""
+
+    def __init__(self, d_model: int, max_len: int = 512):
+        super().__init__()
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[: pe[:, 1::2].shape[1]])
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1)]
+
+
+class TransformerForecaster(nn.Module):
+    """Fully trainable Transformer encoder for multi-step forecasting."""
+
     name = "Transformer"
 
-    def fit(self, x: np.ndarray, y: np.ndarray):
-        d = x.shape[-1]
-        # Single-head attention projections; the last day acts as the query.
-        self.w_q = self.rng.normal(0, 0.22, (d, self.hidden))
-        self.w_k = self.rng.normal(0, 0.22, (d, self.hidden))
-        self.w_v = self.rng.normal(0, 0.22, (d, self.hidden))
-        return super().fit(x, y)
+    def __init__(
+        self,
+        n_features: int,
+        hidden: int,
+        layers: int,
+        heads: int,
+        horizon: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, hidden)
+        self.pos = PositionalEncoding(hidden)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, horizon),
+        )
 
-    def encode(self, x: np.ndarray) -> np.ndarray:
-        q = x[:, -1, :] @ self.w_q
-        k = x @ self.w_k
-        v = x @ self.w_v
-        # Attention weights select relevant days from the full 90-day history.
-        scores = np.einsum("bh,bth->bt", q, k) / math.sqrt(self.hidden)
-        scores -= scores.max(axis=1, keepdims=True)
-        attn = np.exp(scores)
-        attn /= attn.sum(axis=1, keepdims=True)
-        context = np.einsum("bt,bth->bh", attn, v)
-        recent = x[:, -14:, :].mean(axis=1)
-        return np.c_[x[:, -1, :], x.mean(axis=1), recent, np.tanh(context)]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.pos(self.input_proj(x))
+        z = self.encoder(z)
+        return self.head(z[:, -1])
 
 
-class CNNAttentionReservoir(BaseModel):
-    name = "CNN-Attention"
+class CNNTransformerForecaster(nn.Module):
+    """Proposed model: local temporal convolution followed by Transformer encoding."""
 
-    def fit(self, x: np.ndarray, y: np.ndarray):
-        d = x.shape[-1]
-        # A width-5 temporal convolution extracts local usage patterns before attention.
-        self.kernels = self.rng.normal(0, 0.18, (5, d, self.hidden))
-        self.w_q = self.rng.normal(0, 0.20, (self.hidden, self.hidden))
-        self.w_k = self.rng.normal(0, 0.20, (self.hidden, self.hidden))
-        self.w_v = self.rng.normal(0, 0.20, (self.hidden, self.hidden))
-        return super().fit(x, y)
+    name = "CNN-Transformer"
 
-    def encode(self, x: np.ndarray) -> np.ndarray:
-        # Edge padding keeps the encoded sequence length equal to input_len.
-        padded = np.pad(x, ((0, 0), (2, 2), (0, 0)), mode="edge")
-        conv = []
-        for t in range(x.shape[1]):
-            window = padded[:, t : t + 5, :]
-            conv.append(np.tanh(np.einsum("bkd,kdh->bh", window, self.kernels)))
-        conv_x = np.stack(conv, axis=1)
-        q = conv_x[:, -1, :] @ self.w_q
-        k = conv_x @ self.w_k
-        v = conv_x @ self.w_v
-        scores = np.einsum("bh,bth->bt", q, k) / math.sqrt(self.hidden)
-        scores -= scores.max(axis=1, keepdims=True)
-        attn = np.exp(scores)
-        attn /= attn.sum(axis=1, keepdims=True)
-        context = np.einsum("bt,bth->bh", attn, v)
-        # A coarse trend feature helps the long-horizon model distinguish rising/falling windows.
-        trend = x[:, -30:, :].mean(axis=1) - x[:, :30, :].mean(axis=1)
-        return np.c_[x[:, -1, :], x.mean(axis=1), trend, np.tanh(context)]
+    def __init__(
+        self,
+        n_features: int,
+        hidden: int,
+        layers: int,
+        heads: int,
+        horizon: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_features, hidden, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.pos = PositionalEncoding(hidden)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, horizon),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Conv1d expects [batch, channels, time], then Transformer expects [batch, time, hidden].
+        z = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        z = self.encoder(self.pos(z))
+        return self.head(z[:, -1])
+
+
+def build_model(name: str, n_features: int, horizon: int, args) -> nn.Module:
+    if name == "LSTM":
+        return LSTMForecaster(n_features, args.hidden, args.layers, horizon, args.dropout)
+    if name == "Transformer":
+        return TransformerForecaster(n_features, args.hidden, args.layers, args.heads, horizon, args.dropout)
+    if name == "CNN-Transformer":
+        return CNNTransformerForecaster(n_features, args.hidden, args.layers, args.heads, horizon, args.dropout)
+    raise ValueError(f"Unknown model: {name}")
+
+
+def make_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
+    ds = TensorDataset(torch.from_numpy(x), torch.from_numpy(y))
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
+
+
+def train_model(model: nn.Module, xtr: np.ndarray, ytr: np.ndarray, args, device: torch.device) -> nn.Module:
+    """Train all model parameters end to end with backpropagation."""
+
+    n = len(xtr)
+    val_n = max(1, int(n * args.val_ratio))
+    tr_x, val_x = xtr[:-val_n], xtr[-val_n:]
+    tr_y, val_y = ytr[:-val_n], ytr[-val_n:]
+    train_loader = make_loader(tr_x, tr_y, args.batch_size, shuffle=True)
+    val_loader = make_loader(val_x, val_y, args.batch_size, shuffle=False)
+
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = nn.MSELoss()
+    best_state = None
+    best_val = float("inf")
+    patience_left = args.patience
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+
+        val_loss = evaluate_loss(model, val_loader, loss_fn, device)
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_left = args.patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
+@torch.no_grad()
+def evaluate_loss(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, device: torch.device) -> float:
+    model.eval()
+    losses = []
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        losses.append(float(loss_fn(model(xb), yb).cpu()))
+    return float(np.mean(losses))
+
+
+@torch.no_grad()
+def predict(model: nn.Module, x: np.ndarray, batch_size: int, device: torch.device) -> np.ndarray:
+    model.eval()
+    preds = []
+    loader = make_loader(x, np.zeros((len(x), 1), dtype=np.float32), batch_size, shuffle=False)
+    for xb, _ in loader:
+        preds.append(model(xb.to(device)).cpu().numpy())
+    return np.vstack(preds)
 
 
 def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
@@ -346,148 +404,119 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
 
 
 def draw_table(summary: pd.DataFrame, path: Path):
-    """Render a PNG table so the report can include results as a screenshot."""
+    """Render the mean/std metrics as a PNG table for direct inclusion in the report."""
 
-    rows = [["Model", "Horizon", "MSE mean", "MSE std", "MAE mean", "MAE std"]]
-    for _, r in summary.iterrows():
-        rows.append(
-            [
-                str(r["model"]),
-                str(int(r["horizon"])),
-                f"{r['mse_mean']:.3f}",
-                f"{r['mse_std']:.3f}",
-                f"{r['mae_mean']:.3f}",
-                f"{r['mae_std']:.3f}",
-            ]
-        )
-    font = ImageFont.load_default()
-    col_w = [150, 80, 110, 100, 110, 100]
-    row_h = 30
-    img = Image.new("RGB", (sum(col_w) + 40, row_h * len(rows) + 40), "white")
-    draw = ImageDraw.Draw(img)
-    y = 20
-    for i, row in enumerate(rows):
-        x = 20
-        fill = (230, 235, 242) if i == 0 else (255, 255, 255)
-        draw.rectangle([20, y, 20 + sum(col_w), y + row_h], fill=fill, outline=(180, 180, 180))
-        for j, cell in enumerate(row):
-            draw.text((x + 6, y + 9), cell, fill="black", font=font)
-            x += col_w[j]
-            draw.line([x, y, x, y + row_h], fill=(180, 180, 180))
-        y += row_h
-    img.save(path)
+    fig, ax = plt.subplots(figsize=(10, max(2.5, 0.45 * (len(summary) + 1))))
+    ax.axis("off")
+    display = summary.copy()
+    for col in ["mse_mean", "mse_std", "mae_mean", "mae_std"]:
+        display[col] = display[col].map(lambda x: f"{x:.3f}")
+    table = ax.table(cellText=display.values, colLabels=display.columns, loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
 
 
 def draw_curve(y_true: np.ndarray, y_pred: np.ndarray, title: str, path: Path):
-    """Render prediction vs. ground-truth curves without requiring matplotlib."""
+    """Render prediction vs. ground-truth curves."""
 
-    width, height = 1000, 520
-    margin_l, margin_r, margin_t, margin_b = 70, 30, 55, 60
-    img = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
-    draw.text((margin_l, 20), title, fill="black", font=font)
-    left, right = margin_l, width - margin_r
-    top, bottom = margin_t, height - margin_b
-    draw.rectangle([left, top, right, bottom], outline=(60, 60, 60))
-    combined = np.r_[y_true, y_pred]
-    y_min, y_max = float(np.min(combined)), float(np.max(combined))
-    if abs(y_max - y_min) < 1e-9:
-        y_max = y_min + 1.0
-
-    def point(i: int, val: float, n: int):
-        x = left + (right - left) * i / max(1, n - 1)
-        y = bottom - (bottom - top) * (float(val) - y_min) / (y_max - y_min)
-        return x, y
-
-    for frac in np.linspace(0, 1, 6):
-        y = top + (bottom - top) * frac
-        draw.line([left, y, right, y], fill=(230, 230, 230))
-    for arr, color in ((y_true, (40, 90, 180)), (y_pred, (210, 70, 50))):
-        pts = [point(i, v, len(arr)) for i, v in enumerate(arr)]
-        if len(pts) > 1:
-            draw.line(pts, fill=color, width=2)
-    draw.line([left + 20, bottom + 30, left + 70, bottom + 30], fill=(40, 90, 180), width=3)
-    draw.text((left + 78, bottom + 25), "Ground Truth", fill="black", font=font)
-    draw.line([left + 210, bottom + 30, left + 260, bottom + 30], fill=(210, 70, 50), width=3)
-    draw.text((left + 268, bottom + 25), "Prediction", fill="black", font=font)
-    draw.text((left, bottom + 42), "Day index", fill="black", font=font)
-    draw.text((8, top), "Power", fill="black", font=font)
-    img.save(path)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(y_true, label="Ground Truth", linewidth=1.7)
+    ax.plot(y_pred, label="Prediction", linewidth=1.7)
+    ax.set_title(title)
+    ax.set_xlabel("Day index")
+    ax.set_ylabel("Global active power")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
 
 
 def run(args):
     OUTPUT_DIR.mkdir(exist_ok=True)
+    set_seed(args.seed)
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu")
+    if args.device in {"cpu", "cuda"}:
+        device = torch.device(args.device)
+    print(f"Using device: {device}")
+
     ds = load_dataset()
     train_x, test_x, train_y, test_y, y_mean, y_std = standardize(
         ds.train, ds.test, ds.features, ds.target
     )
-    models = [LSTMReservoir, TransformerReservoir, CNNAttentionReservoir]
+    model_names = ["LSTM", "Transformer", "CNN-Transformer"]
     horizons = [90, 365]
     rows = []
-    predictions = {}
+    prediction_figures = {}
 
     for horizon in horizons:
         # Short-term and long-term tasks are trained independently as required.
         xtr, ytr = make_windows(train_x, train_y, args.input_len, horizon)
         xte, yte = make_windows(
-            # Prepend the final training window so the first test prediction has 90 days of history.
+            # Prepend the last training days so test windows have full historical context.
             np.vstack([train_x[-args.input_len :], test_x]),
             np.r_[train_y[-args.input_len :], test_y],
             args.input_len,
             horizon,
         )
         if args.max_train_samples:
-            # Optional acceleration for smoke tests; full experiments leave this unset.
             xtr = xtr[-args.max_train_samples :]
             ytr = ytr[-args.max_train_samples :]
-        # Report figures use the final available forecast window for each horizon.
-        xte_last, yte_last = xte[-1:], yte[-1:]
 
-        for model_cls in models:
+        for model_name in model_names:
             for run_id in range(args.runs):
                 seed = args.seed + run_id
-                model = model_cls(seed=seed, hidden=args.hidden).fit(xtr, ytr)
-                pred = model.predict(xte_last)
-                # Convert back to the original power scale before computing final metrics.
-                true_real = yte_last[0] * y_std + y_mean
-                pred_real = pred[0] * y_std + y_mean
+                set_seed(seed)
+                model = build_model(model_name, xtr.shape[-1], horizon, args)
+                model = train_model(model, xtr, ytr, args, device)
+                pred = predict(model, xte, args.batch_size, device)
+                true_real = yte * y_std + y_mean
+                pred_real = pred * y_std + y_mean
                 mse, mae = metrics(true_real, pred_real)
                 rows.append(
                     {
-                        "model": model_cls.name,
+                        "model": model_name,
                         "horizon": horizon,
                         "run": run_id + 1,
                         "mse": mse,
                         "mae": mae,
                     }
                 )
-                predictions[(model_cls.name, horizon, run_id)] = (true_real, pred_real)
+                # Use the last test forecast from the first run for report curves.
+                if run_id == 0:
+                    prediction_figures[(model_name, horizon)] = (true_real[-1], pred_real[-1])
                 print(
-                    f"{model_cls.name:14s} horizon={horizon:3d} "
+                    f"{model_name:16s} horizon={horizon:3d} "
                     f"run={run_id + 1} mse={mse:.3f} mae={mae:.3f}"
                 )
 
-    # Save both raw repeated-run metrics and the mean/std summary required by the assignment.
     metrics_df = pd.DataFrame(rows)
     metrics_df.to_csv(OUTPUT_DIR / "metrics.csv", index=False, encoding="utf-8-sig")
     summary = (
         metrics_df.groupby(["model", "horizon"])
-        .agg(mse_mean=("mse", "mean"), mse_std=("mse", "std"), mae_mean=("mae", "mean"), mae_std=("mae", "std"))
+        .agg(
+            mse_mean=("mse", "mean"),
+            mse_std=("mse", "std"),
+            mae_mean=("mae", "mean"),
+            mae_std=("mae", "std"),
+        )
         .reset_index()
     )
     summary.to_csv(OUTPUT_DIR / "metrics_summary.csv", index=False, encoding="utf-8-sig")
     draw_table(summary, OUTPUT_DIR / "metrics_summary.png")
 
-    for (model, horizon, run_id), (true, pred) in predictions.items():
-        if run_id == 0:
-            safe_model = model.lower().replace("-", "_")
-            draw_curve(
-                true,
-                pred,
-                f"{model} forecast, horizon={horizon}",
-                OUTPUT_DIR / f"curve_{safe_model}_{horizon}.png",
-            )
+    for (model_name, horizon), (true, pred) in prediction_figures.items():
+        safe_model = model_name.lower().replace("-", "_")
+        draw_curve(
+            true,
+            pred,
+            f"{model_name} forecast, horizon={horizon}",
+            OUTPUT_DIR / f"curve_{safe_model}_{horizon}.png",
+        )
     print(f"Saved outputs to {OUTPUT_DIR}")
 
 
@@ -495,8 +524,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-len", type=int, default=90)
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--hidden", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--max-train-samples", type=int, default=None)
     args = parser.parse_args()
     run(args)

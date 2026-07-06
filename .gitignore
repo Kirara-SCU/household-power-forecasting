@@ -18,4 +18,6 @@ outputs/
 *.toc
 *.xdv
 *.synctex.gz
+*.fdb_latexmk
+*.fls
 report/report.pdf
