@@ -39,6 +39,12 @@ MEAN_COLUMNS = ["voltage", "global_intensity"]
 TARGET = "global_active_power"
 
 
+def log(message: str = "") -> None:
+    """Print immediately so long training runs still show screenshot-friendly progress."""
+
+    print(message, flush=True)
+
+
 @dataclass(frozen=True)
 class Dataset:
     """Daily train/test split plus the feature list used by all models."""
@@ -140,7 +146,7 @@ def download_uci() -> Path:
     zip_path = DATA_DIR / "household_power_consumption.zip"
     if txt_path.exists():
         return txt_path
-    print("Downloading UCI Individual household electric power consumption dataset...")
+    log("Downloading UCI Individual household electric power consumption dataset...")
     urllib.request.urlretrieve(UCI_URL, zip_path)
     with zipfile.ZipFile(zip_path) as zf:
         zf.extract("household_power_consumption.txt", DATA_DIR)
@@ -442,9 +448,18 @@ def run(args):
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu")
     if args.device in {"cpu", "cuda"}:
         device = torch.device(args.device)
-    print(f"Using device: {device}")
+    log("=" * 72)
+    log("Household power forecasting experiment")
+    log("=" * 72)
+    log(f"Using device: {device}")
+    log(
+        "Config: "
+        f"runs={args.runs}, epochs={args.epochs}, input_len={args.input_len}, "
+        f"hidden={args.hidden}, layers={args.layers}, batch_size={args.batch_size}"
+    )
 
     ds = load_dataset()
+    log(f"Daily samples: train={len(ds.train)}, test={len(ds.test)}, features={len(ds.features)}")
     train_x, test_x, train_y, test_y, y_mean, y_std = standardize(
         ds.train, ds.test, ds.features, ds.target
     )
@@ -454,6 +469,8 @@ def run(args):
     prediction_figures = {}
 
     for horizon in horizons:
+        log("")
+        log(f"Preparing horizon={horizon} task")
         # Short-term and long-term tasks are trained independently as required.
         xtr, ytr = make_windows(train_x, train_y, args.input_len, horizon)
         xte, yte = make_windows(
@@ -466,11 +483,13 @@ def run(args):
         if args.max_train_samples:
             xtr = xtr[-args.max_train_samples :]
             ytr = ytr[-args.max_train_samples :]
+        log(f"Window samples: train={len(xtr)}, test={len(xte)}")
 
         for model_name in model_names:
             for run_id in range(args.runs):
                 seed = args.seed + run_id
                 set_seed(seed)
+                log(f"Training {model_name}, horizon={horizon}, run={run_id + 1}/{args.runs}...")
                 model = build_model(model_name, xtr.shape[-1], horizon, args)
                 model = train_model(model, xtr, ytr, args, device)
                 pred = predict(model, xte, args.batch_size, device)
@@ -489,7 +508,7 @@ def run(args):
                 # Use the last test forecast from the first run for report curves.
                 if run_id == 0:
                     prediction_figures[(model_name, horizon)] = (true_real[-1], pred_real[-1])
-                print(
+                log(
                     f"{model_name:16s} horizon={horizon:3d} "
                     f"run={run_id + 1} mse={mse:.3f} mae={mae:.3f}"
                 )
@@ -509,6 +528,15 @@ def run(args):
     summary.to_csv(OUTPUT_DIR / "metrics_summary.csv", index=False, encoding="utf-8-sig")
     draw_table(summary, OUTPUT_DIR / "metrics_summary.png")
 
+    display = summary.copy()
+    for col in ["mse_mean", "mse_std", "mae_mean", "mae_std"]:
+        display[col] = display[col].map(lambda x: f"{x:.3f}")
+    log("")
+    log("=" * 72)
+    log(f"Final {args.runs}-run summary (mean +/- std)")
+    log("=" * 72)
+    log(display.to_string(index=False))
+
     for (model_name, horizon), (true, pred) in prediction_figures.items():
         safe_model = model_name.lower().replace("-", "_")
         draw_curve(
@@ -517,7 +545,15 @@ def run(args):
             f"{model_name} forecast, horizon={horizon}",
             OUTPUT_DIR / f"curve_{safe_model}_{horizon}.png",
         )
-    print(f"Saved outputs to {OUTPUT_DIR}")
+    log("")
+    log("Generated report artifacts:")
+    for path in [
+        OUTPUT_DIR / "metrics.csv",
+        OUTPUT_DIR / "metrics_summary.csv",
+        OUTPUT_DIR / "metrics_summary.png",
+    ]:
+        log(f"- {path}")
+    log(f"Saved outputs to {OUTPUT_DIR}")
 
 
 def main():
