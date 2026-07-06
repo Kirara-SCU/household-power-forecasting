@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local/course materials
+2026-*.pdf
+要求.txt
+
+# Datasets and generated experiment artifacts
+data/
+individual+household+electric+power+consumption/
+outputs/
+
+# LaTeX build products
+*.aux
+*.log
+*.out
+*.toc
+*.xdv
+*.synctex.gz
+report/report.pdf
